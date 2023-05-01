@@ -3,6 +3,7 @@ import os
 import sys
 import gzip
 import zlib
+import math
 import struct
 import zipfile
 import tarfile
@@ -10,6 +11,34 @@ import hashlib
 import argparse
 from io import BytesIO
 import xml.etree.ElementTree as ET
+
+class hexdump:
+    def __init__(self, buf, off=0):
+        self.buf = buf
+        self.off = off
+
+    def __iter__(self):
+        last_bs, last_line = None, None
+        for i in range(0, len(self.buf), 16):
+            bs = bytearray(self.buf[i : i + 16])
+            line = "{:08x}  {:23}  {:23}  |{:16}|".format(
+                self.off + i,
+                " ".join(("{:02x}".format(x) for x in bs[:8])),
+                " ".join(("{:02x}".format(x) for x in bs[8:])),
+                "".join((chr(x) if 32 <= x < 127 else "." for x in bs)),
+            )
+            if bs == last_bs:
+                line = "*"
+            if bs != last_bs or line != last_line:
+                yield line
+            last_bs, last_line = bs, line
+        yield "{:08x}".format(self.off + len(self.buf))
+
+    def __str__(self):
+        return "\n".join(self)
+
+    def __repr__(self):
+        return "\n".join(self)
 
 ## Region for ar file format
 AR_MAGIC = b"!<arch>\n"
@@ -106,6 +135,7 @@ class Archive:
                 entry.mode = mode.decode().rstrip()
                 entry.size = str(size)
                 entry.data = self.data[index:index+size]
+                hexdump(entry.data)
                 index += pad(size, 2)
                 self.entries.append(entry)
 
@@ -224,7 +254,8 @@ def create_vtar(entry):
         )
 
 class Payload:
-    def __init__(self, data=[]):
+    def __init__(self, data=[], tarfmt = False):
+        self.astar = tarfmt
         self.filename = ""
         magic = data[0:2]
         if magic == GZIP_MAGIC:
@@ -274,28 +305,35 @@ class Payload:
         self.sha1 = hash1.hexdigest()
         return payload
 
+def alignup(x, base=512):
+    return base * math.ceil(x / base)
+
 def load(data):
     lookup_data = None
-    index = 0
     header_size = struct.calcsize(VTAR_FMT)
+    chunk_start = 0
     contents = []
     while True:
-        chunk_start = header_size * index
         chunk_end = chunk_start + header_size
-        index += 1
         buffer = data[chunk_start:chunk_end]
         if len(buffer) < header_size:
             break
         name, mode, owner, group, size, mtime, chksum, t, linkname, magic, version, uname, gname, devmajor, devminor, prefix, offset, textoffset, textsize, numfixuppgs = struct.unpack(VTAR_FMT, buffer)
-        if magic.decode() != 'visor ':
+        if not (magic == b'visor ' or magic == b'ustar '):
             break
-        name = name.decode().rstrip()
+        name = name.decode().rstrip('\0')
         content = []
         if t == b'0':
             size = int(size.decode().rstrip('\0'), 8)
-            content = data[offset:offset+size]
+            if offset:
+                content = data[offset:offset+size]
+                chunk_start = chunk_end
+            else:
+                content = data[chunk_end:chunk_end+size]
+                chunk_start = alignup(chunk_end + size)
         else:
             size = 0
+            chunk_start = chunk_end
         contents.append(VtarEntry(
             name, 
             mode.decode(), 
@@ -326,7 +364,14 @@ def parse_args():
     parser.add_argument('-x', '--extract', action='store_true', help='Save vib file to disk')
     parser.add_argument('-d', '--data', help='Specifies the directory containing the content to create VIB')
     parser.add_argument('-o', '--output', help='Output folder to save the VIB (create) or VIB contents (extract)')
+    parser.add_argument('-t', '--tar', action='store_true', help='Output payload as a standard tar vs VMware vtar')
     return parser.parse_args()
+
+def gunziphash(obj, hash='sha1'):
+    algo = hashlib.new(hash)
+    decompressed = gzip.decompress(obj.getbuffer())
+    algo.update(decompressed)
+    return algo.hexdigest()
 
 def main():
     args = parse_args()
@@ -358,60 +403,68 @@ def main():
             vib_contents.append(pkcs_file)
             for name in payload_names:
                 payload = Payload()
-                payload_dir = os.path.join(data_dir, name)
-                for root, dirs, files in os.walk(payload_dir):
-                    relative = os.path.relpath(root, payload_dir)
-                    if relative != '.':
-                        stat = os.stat(root)
-                        relative += '/'
-                        entry = VtarEntry()
-                        entry.name = relative
-                        entry.mode = "{0:o}".format(stat.st_mode & 0o777)
-                        entry.uid = str(stat.st_uid)
-                        entry.gid = str(stat.st_gid)
-                        entry.mtime = str(int(stat.st_mtime))
-                        entry.type = '5'
-                        entry.version = ' '
-                        entry.uname = 'rsh'
-                        entry.gname = 'rsh'
-                        payload.add_entry(entry)
-                        for file in files:
-                            fstat = os.stat(os.path.join(root, file))
-                            file_entry = VtarEntry()
-                            file_entry.name = relative + file
-                            file_entry.mode = "{0:o}".format(fstat.st_mode & 0o777)
-                            file_entry.uid = str(fstat.st_uid)
-                            file_entry.gid = str(fstat.st_gid)
-                            file_entry.size = fstat.st_size
-                            file_entry.mtime = str(int(fstat.st_mtime))
-                            file_entry.type = '0'
-                            file_entry.version = ' '
-                            file_entry.uname = 'rsh'
-                            file_entry.gname = 'rsh'
-                            with open(os.path.join(root, file), 'rb') as f:
-                                file_entry.content = f.read()
-                            payload.add_entry(file_entry)
-                vtar = payload.create_payload()
                 payload_gzipped = BytesIO()
-                with gzip.GzipFile(filename="{}.vtar".format(name), fileobj=payload_gzipped, mode='wb') as f:
-                    f.write(vtar)
+                payload_dir = os.path.join(data_dir, name)
+                if args.tar:
+                    with tarfile.open(fileobj=payload_gzipped, mode='w:gz', format=tarfile.GNU_FORMAT) as tar:
+                        for entry in os.listdir(payload_dir):
+                            p = os.path.join(payload_dir, entry)
+                            tar.add(p, arcname=entry)
+                    payload.sha256 = gunziphash(payload_gzipped, "sha256")
+                    payload.sha1 = gunziphash(payload_gzipped, "sha1")
+                else:
+                    for root, dirs, files in os.walk(payload_dir):
+                        relative = os.path.relpath(root, payload_dir)
+                        if relative != '.':
+                            stat = os.stat(root)
+                            relative += '/'
+                            entry = VtarEntry()
+                            entry.name = relative
+                            print(relative)
+                            entry.mode = "{0:o}".format(stat.st_mode & 0o777)
+                            entry.uid = str(stat.st_uid)
+                            entry.gid = str(stat.st_gid)
+                            entry.mtime = str(int(stat.st_mtime))
+                            entry.type = '5'
+                            entry.version = ' '
+                            entry.uname = 'rsh'
+                            entry.gname = 'rsh'
+                            payload.add_entry(entry)
+                            for file in files:
+                                fstat = os.stat(os.path.join(root, file))
+                                file_entry = VtarEntry()
+                                file_entry.name = relative + file
+                                file_entry.mode = "{0:o}".format(fstat.st_mode & 0o777)
+                                file_entry.uid = str(fstat.st_uid)
+                                file_entry.gid = str(fstat.st_gid)
+                                file_entry.size = fstat.st_size
+                                file_entry.mtime = str(int(fstat.st_mtime))
+                                file_entry.type = '0'
+                                file_entry.version = ' '
+                                file_entry.uname = 'rsh'
+                                file_entry.gname = 'rsh'
+                                with open(os.path.join(root, file), 'rb') as f:
+                                    file_entry.content = f.read()
+                                payload.add_entry(file_entry)
+                    vtar = payload.create_payload()
+                    with gzip.GzipFile(filename="{}.vtar".format(name), fileobj=payload_gzipped, mode='wb') as f:
+                        f.write(vtar)
                 file = ArchiveEntry()
                 file.name = name
-                file.date = "0"
-                file.mode = "0"
+                fstat = os.stat(os.path.join(data_dir, name))
+                file.date = str(int(fstat.st_mtime))
+                file.mode = "100644"
                 file.gid = "0"
                 file.uid = "0"
-                file.data = payload_gzipped.getvalue()
+                file.data = payload_gzipped.getbuffer()
                 file.size = str(len(file.data))
-                hash256 = hashlib.sha256()
-                hash256.update(file.data)
-                payload.gzippedsha256 = hash256.hexdigest()
+                payload.gzippedsha256 = hashlib.sha256(payload_gzipped.getbuffer()).hexdigest()
                 xmlTree = ET.parse(os.path.join(data_dir, "descriptor.xml"))
                 rootElement = xmlTree.getroot()
                 for element in rootElement.findall('payloads'):
                     for payloadelement in element.findall('payload'):
                         if payloadelement.get('name') == name:
-                            element.set('size', str(file.size))
+                            payloadelement.set('size', str(file.size))
                             for chksum in payloadelement.findall('checksum'):
                                 checksum_type = chksum.get('checksum-type')
                                 if checksum_type == "sha-1":
@@ -453,13 +506,13 @@ def main():
             else:
                 content = entry.data
                 payload = Payload(content)
-                payload_dirname = payload.filename.rstrip('.vtar')
+                if payload.filename != "":
+                    payload_dirname = payload.filename.rstrip('.vtar')
+                else:
+                    payload_dirname = entry.name
                 for item in payload:
                     print("---------------------------------")
                     print(item.name)
-                    if item.is_file():
-                        print("Content:")
-                        print(item.content.decode())
                     if args.extract:
                         payload_dir = os.path.join(out_dir, payload_dirname)
                         if not os.path.exists(payload_dir):
